@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   desk,
   useDesk,
@@ -118,6 +118,7 @@ function OpsPanel(props: {
   const pax = state.passengers.filter((p) => p.voyageId === voyage.id && p.status !== 'removed');
   const unassigned = pax.filter((p) => !p.cabinId);
   const confirmation = state.confirmations[voyage.id];
+  const confirmValid = !!confirmation && !confirmation.invalidated;
 
   return (
     <div className="ops">
@@ -132,7 +133,8 @@ function OpsPanel(props: {
         >
           {state.voyages.map((v) => (
             <option key={v.id} value={v.id}>
-              {v.code} {v.name}（{fmtTs(v.departureTs)} 出发{v.status === 'confirmed' ? ' · 已确认' : ''}）
+              {v.code} {v.name}（{fmtTs(v.departureTs)} 出发
+              {v.status === 'confirmed' ? ' · 已确认' : v.status === 'invalidated' ? ' · 确认已失效' : ''}）
             </option>
           ))}
         </select>
@@ -220,13 +222,17 @@ function OpsPanel(props: {
         <section className="panel conflicts-panel">
           <PanelTitle title="实时复核冲突" hint={`错误 ${errors.length} · 警告 ${warnings.length}`} />
           <ConflictList conflicts={[...errors, ...warnings]} onJumpCabin={setSelectedCabin} />
+          {/* key 随航次变化：切换航次时本地知悉勾选与成功提示全部重置，不残留 */}
           <ConfirmationBox
+            key={voyage.id}
             voyage={voyage}
             errors={errors}
             warnings={warnings}
             agent={agent}
             unassignedCount={unassigned.length}
-            confirmed={!!confirmation}
+            confirmed={confirmValid}
+            invalidated={!!confirmation?.invalidated}
+            invalidReason={confirmation?.invalidated?.reason}
           />
         </section>
       </div>
@@ -567,6 +573,8 @@ function ConfirmationBox({
   agent,
   unassignedCount,
   confirmed,
+  invalidated,
+  invalidReason,
 }: {
   voyage: Voyage;
   errors: Conflict[];
@@ -574,10 +582,17 @@ function ConfirmationBox({
   agent: string;
   unassignedCount: number;
   confirmed: boolean;
+  invalidated?: boolean;
+  invalidReason?: string;
 }) {
   const [ack, setAck] = useState<Record<string, boolean>>({});
   const [msg, setMsg] = useState<string | null>(null);
   const allAck = warnings.every((w) => ack[w.id]);
+
+  // 确认被自动失效或出现错误时，立即清掉可能残留的成功提示（切航次由 key 保证重置）
+  useEffect(() => {
+    if (invalidated || errors.length > 0) setMsg(null);
+  }, [invalidated, errors.length]);
 
   const doConfirm = () => {
     if (confirmed) {
@@ -592,11 +607,22 @@ function ConfirmationBox({
   };
 
   return (
-    <div className={'confirm-box' + (confirmed ? ' confirmed' : errors.length ? ' blocked' : '')}>
+    <div
+      className={
+        'confirm-box' + (confirmed ? ' confirmed' : invalidated || errors.length ? ' blocked' : '')
+      }
+    >
       <div className="cf-title">
-        {confirmed ? '🟢 登船清单已确认' : errors.length ? '🔴 冲突未解除，禁止确认' : '🟡 可确认（需知悉全部警告）'}
+        {confirmed
+          ? '🟢 登船清单已确认'
+          : invalidated
+            ? '⛔ 确认已自动失效（出现新的错误级冲突）'
+            : errors.length
+              ? '🔴 冲突未解除，禁止确认'
+              : '🟡 可确认（需知悉全部警告）'}
       </div>
-      {!confirmed && !!warnings.length && (
+      {invalidated && invalidReason && <p className="editor-msg err">{invalidReason}</p>}
+      {!confirmed && !invalidated && !!warnings.length && (
         <div className="ack-list">
           {warnings.map((w) => (
             <label key={w.id} className="ack">
@@ -618,7 +644,7 @@ function ConfirmationBox({
         disabled={!confirmed && (errors.length > 0 || !allAck)}
         onClick={doConfirm}
       >
-        {confirmed ? '撤回确认' : '确认登船清单'}
+        {confirmed ? '撤回确认' : invalidated ? '解除冲突后重新确认' : '确认登船清单'}
       </button>
       {msg && <p className={'editor-msg ' + (msg.startsWith('✅') ? 'ok' : 'err')}>{msg}</p>}
     </div>
@@ -901,6 +927,7 @@ const EVENT_LABEL: Record<string, string> = {
   PROPOSAL_DISCARD: '裁定：丢弃',
   CONFIRM: '确认登船清单',
   CONFIRM_REVOKE: '撤回确认',
+  CONFIRM_INVALIDATED: '确认自动失效',
   CONFIG_UPDATE: '规则参数调整',
 };
 
@@ -923,7 +950,12 @@ function EventLog() {
       </div>
       <ul className="eventlog">
         {shown.slice(0, 120).map((e) => (
-          <li key={e.id} className={e.type.startsWith('PROPOSAL_RAISE') ? 'ev-raise' : ''}>
+          <li
+            key={e.id}
+            className={
+              e.type.startsWith('PROPOSAL_RAISE') || e.type === 'CONFIRM_INVALIDATED' ? 'ev-raise' : ''
+            }
+          >
             <span className="ev-id">#{e.id}</span>
             <span className="ev-time">{fmtTs(e.ts)}</span>
             <span className="ev-by">{e.by}</span>
@@ -977,6 +1009,14 @@ function EventSummary({ type, payload }: { type: string; payload: Record<string,
   if (type === 'AUTO_ASSIGN' || type === 'ASSIGNMENT_CLEAR' || type === 'CONFIRM' || type === 'CONFIRM_REVOKE') {
     const v = state.voyages.find((x) => x.id === payload.voyageId);
     return <span className="ev-detail">{v?.code}</span>;
+  }
+  if (type === 'CONFIRM_INVALIDATED') {
+    const v = state.voyages.find((x) => x.id === payload.voyageId);
+    return (
+      <span className="ev-detail red">
+        {v?.code}：{String(payload.reason)}
+      </span>
+    );
   }
   if (type === 'PASSENGER_ADD') {
     const p = payload.passenger as Passenger;

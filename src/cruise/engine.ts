@@ -275,11 +275,20 @@ export function revalidateVoyage(state: AppState, voyageId: string): Conflict[] 
     }
   }
 
-  // --- 救生艇超员（按集合点聚合，含冗余） ---
+  // --- 救生艇超员（按集合点聚合，含冗余；无艇但已有旅客同样报错） ---
   const loads = stationLoads(state, voyageId);
   for (const load of loads) {
     const required = Math.ceil(load.assigned * (1 + cfg.boatCapacityMargin));
-    if (load.boatCapacity > 0 && required > load.boatCapacity) {
+    if (load.assigned > 0 && load.boatCapacity === 0) {
+      conflicts.push({
+        id: conflictId(['BOAT_NONE', voyageId, load.station.id]),
+        rule: 'BOAT_OVERCAP',
+        severity: 'error',
+        voyageId,
+        stationId: load.station.id,
+        detail: `集合点 ${load.station.name} 已归集 ${load.assigned} 名旅客，但未配置任何救生艇，艇位为 0，无可用救生容量`,
+      });
+    } else if (load.boatCapacity > 0 && required > load.boatCapacity) {
       conflicts.push({
         id: conflictId(['BOAT_OVERCAP', voyageId, load.station.id]),
         rule: 'BOAT_OVERCAP',
@@ -295,23 +304,23 @@ export function revalidateVoyage(state: AppState, voyageId: string): Conflict[] 
     }
   }
 
-  // --- 集合点失衡 ---
+  // --- 集合点超容（单点在用也必须检查）与多点负载率失衡 ---
   const usedLoads = loads.filter((l) => l.assigned > 0);
+  for (const load of usedLoads) {
+    if (load.assigned > load.station.capacity) {
+      conflicts.push({
+        id: conflictId(['STATION_FULL', voyageId, load.station.id]),
+        rule: 'STATION_IMBALANCE',
+        severity: 'error',
+        voyageId,
+        stationId: load.station.id,
+        detail: `集合点 ${load.station.name} 归集 ${load.assigned} 人，超过容量 ${load.station.capacity}（唯一在用集合点同样不得超容）`,
+      });
+    }
+  }
   if (usedLoads.length >= 2) {
     const ratios = usedLoads.map((l) => l.ratio);
     const spread = Math.max(...ratios) - Math.min(...ratios);
-    for (const load of usedLoads) {
-      if (load.assigned > load.station.capacity) {
-        conflicts.push({
-          id: conflictId(['STATION_FULL', voyageId, load.station.id]),
-          rule: 'STATION_IMBALANCE',
-          severity: 'error',
-          voyageId,
-          stationId: load.station.id,
-          detail: `集合点 ${load.station.name} 归集 ${load.assigned} 人，超过容量 ${load.station.capacity}`,
-        });
-      }
-    }
     if (spread > cfg.stationImbalanceRatio) {
       const hi = usedLoads.reduce((a, b) => (b.ratio > a.ratio ? b : a));
       const lo = usedLoads.reduce((a, b) => (b.ratio < a.ratio ? b : a));
@@ -362,22 +371,35 @@ export function revalidateVoyage(state: AppState, voyageId: string): Conflict[] 
   return conflicts;
 }
 
-/** 清洁周转：同一舱室相邻航次（按出发时间）间隔不足 */
+/**
+ * 清洁周转 / 时间重叠：对全部航次两两检查（不再只看时间相邻航次）。
+ * 同一舱室被两个航次复用，且两航次区间重叠或前航次到港至后航次出发间隔不足最少周转时间，即报错。
+ */
 export function revalidateTurnaround(state: AppState): Conflict[] {
   const cfg = state.config;
   const out: Conflict[] = [];
   const active = state.voyages.filter((v) => v.status !== 'cancelled');
   if (active.length < 2) return out;
-  const sorted = [...active].sort((a, b) => a.departureTs - b.departureTs);
-  for (const cabin of state.cabins) {
-    for (let i = 0; i < sorted.length - 1; i++) {
-      const a = sorted[i];
-      const b = sorted[i + 1];
-      const gap = b.departureTs - a.arrivalTs;
-      if (gap < 0 || gap >= cfg.minTurnaroundMs) continue;
-      const occA = voyagePassengers(state, a.id).some((p) => p.cabinId === cabin.id);
-      const occB = voyagePassengers(state, b.id).some((p) => p.cabinId === cabin.id);
-      if (occA && occB) {
+
+  for (let i = 0; i < active.length; i++) {
+    for (let j = i + 1; j < active.length; j++) {
+      // 每对航次只检查一次；按出发时间（并列按 id）定向为 a→b
+      const [a, b] =
+        active[i].departureTs < active[j].departureTs ||
+        (active[i].departureTs === active[j].departureTs && active[i].id < active[j].id)
+          ? [active[i], active[j]]
+          : [active[j], active[i]];
+
+      const overlap = b.departureTs < a.arrivalTs; // 航次区间重叠（船舶不可能同时开两班，属排班冲突）
+      const gap = b.departureTs - a.arrivalTs; // 重叠时为负
+      if (!overlap && gap >= cfg.minTurnaroundMs) continue;
+
+      const paxA = voyagePassengers(state, a.id);
+      const paxB = voyagePassengers(state, b.id);
+      for (const cabin of state.cabins) {
+        const inA = paxA.filter((p) => p.cabinId === cabin.id);
+        const inB = paxB.filter((p) => p.cabinId === cabin.id);
+        if (!inA.length || !inB.length) continue;
         out.push({
           id: conflictId(['TURNAROUND', cabin.id, a.id, b.id]),
           rule: 'TURNAROUND',
@@ -385,11 +407,16 @@ export function revalidateTurnaround(state: AppState): Conflict[] {
           voyageId: b.id,
           voyagePair: [a.id, b.id],
           cabinId: cabin.id,
-          detail: `舱 ${cabin.deck}-${cabin.number} 在 ${a.code}(${new Date(a.arrivalTs).toLocaleString('zh-CN')}) 与 ${b.code}(${new Date(
-            b.departureTs,
-          ).toLocaleString('zh-CN')}) 间仅 ${(gap / 3600000).toFixed(1)} 小时，不足 ${(
-            cfg.minTurnaroundMs / 3600000
-          ).toFixed(0)} 小时清洁周转`,
+          passengerIds: [...inA.map((p) => p.id), ...inB.map((p) => p.id)],
+          detail: overlap
+            ? `舱 ${cabin.deck}-${cabin.number} 在时间重叠的 ${a.code}(${new Date(a.departureTs).toLocaleString('zh-CN')} 出发) 与 ${b.code}(${new Date(
+                b.departureTs,
+              ).toLocaleString('zh-CN')} 出发) 中被同时复用（${inA.length} 人 / ${inB.length} 人），无清洁周转窗口`
+            : `舱 ${cabin.deck}-${cabin.number} 在 ${a.code}(${new Date(a.arrivalTs).toLocaleString('zh-CN')}) 与 ${b.code}(${new Date(
+                b.departureTs,
+              ).toLocaleString('zh-CN')}) 间仅 ${(gap / 3600000).toFixed(1)} 小时，不足 ${(
+                cfg.minTurnaroundMs / 3600000
+              ).toFixed(0)} 小时清洁周转`,
         });
       }
     }
@@ -695,6 +722,21 @@ function apply(state: AppState, type: string, payload: AnyPayload): void {
       if (v) v.status = 'active';
       break;
     }
+    case 'CONFIRM_INVALIDATED': {
+      // 确认后出现新的错误级冲突：确认记录立即失效（原确认保留作审计凭据）
+      const conf = state.confirmations[payload.voyageId as string];
+      if (conf) {
+        conf.invalidated = {
+          by: payload.by as string,
+          ts: payload.ts as number,
+          reason: payload.reason as string,
+          conflictIds: payload.conflictIds as string[],
+        };
+      }
+      const v = byId(state.voyages, payload.voyageId as string);
+      if (v && v.status === 'confirmed') v.status = 'invalidated';
+      break;
+    }
     case 'CONFIG_UPDATE':
       state.config = { ...state.config, ...(payload.patch as Partial<RulesConfig>) };
       break;
@@ -919,6 +961,39 @@ export function confirmVoyage(
 
 export function revokeConfirmation(store: EventStore, voyageId: string, by: string): void {
   appendEvent(store, by, 'CONFIRM_REVOKE', { voyageId, ts: Date.now() });
+}
+
+/**
+ * 确认失效清扫：任何已确认航次一旦出现错误级冲突（新产生或原冲突回归），
+ * 确认记录立即失效并写入事件链。只在现场提交路径调用；重放时失效事件已在链中，不重复追加。
+ * 返回本次失效的航次数。
+ */
+export function sweepInvalidations(store: EventStore, by = '系统'): string[] {
+  const invalidated: string[] = [];
+  const all = revalidate(store.state);
+  for (const [voyageId, confirmation] of Object.entries(store.state.confirmations)) {
+    if (confirmation.invalidated) continue;
+    const errors = blockingConflicts(all, voyageId);
+    if (!errors.length) continue;
+    const reason = `确认后新增/仍有 ${errors.length} 项错误级冲突，登船清单确认自动失效：${errors
+      .slice(0, 3)
+      .map((c) => RULE_LABEL[c.rule])
+      .join('、')}${errors.length > 3 ? ' 等' : ''}`;
+    appendEvent(store, by, 'CONFIRM_INVALIDATED', {
+      voyageId,
+      ts: Date.now(),
+      reason,
+      conflictIds: errors.map((c) => c.id),
+    });
+    invalidated.push(voyageId);
+  }
+  return invalidated;
+}
+
+/** 确认记录当前是否有效（未失效） */
+export function isConfirmationValid(state: AppState, voyageId: string): boolean {
+  const c = state.confirmations[voyageId];
+  return !!c && !c.invalidated;
 }
 
 export { clone, byId };

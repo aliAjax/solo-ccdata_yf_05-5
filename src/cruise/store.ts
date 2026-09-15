@@ -11,6 +11,7 @@ import {
   revokeConfirmation,
   revalidate,
   replay,
+  sweepInvalidations,
 } from './engine';
 import type { CabinEditProposal, Conflict, DomainEvent, EventStore } from './types';
 
@@ -56,6 +57,8 @@ export class DeskStore {
     } else {
       this.store = emptyStore();
     }
+    // 启动自愈：旧数据下已确认航次若命中当前规则（含新增校验），确认立即失效
+    this.sweep('系统');
     this.conflicts = revalidate(this.store.state);
   }
 
@@ -80,29 +83,23 @@ export class DeskStore {
     return this.conflicts.filter((c) => c.voyageId === voyageId);
   }
 
-  /** 任意领域写操作的统一入口：追加事件 → 落盘 → 全量复核 → 通知 */
+  /** 任意领域写操作的统一入口：追加事件 → 确认失效清扫 → 落盘 → 全量复核 → 通知 */
   commit(by: string, type: string, payload: Record<string, unknown>): DomainEvent {
     const ev = appendEvent(this.store, by, type, { ts: Date.now(), ...payload });
-    this.persist();
-    this.conflicts = revalidate(this.store.state);
-    this.emit();
+    this.afterChange();
     return ev;
   }
 
   /** 提交舱室修改提案：无并发直接生效；命中过期版本则进入裁定队列，两份修改都保留 */
   submitProposal(by: string, proposal: Omit<CabinEditProposal, 'id' | 'ts'>) {
     const result = dispatchCabinProposal(this.store, by, proposal);
-    this.persist();
-    this.conflicts = revalidate(this.store.state);
-    this.emit();
+    this.afterChange();
     return result;
   }
 
   resolveArbitration(id: string, decision: 'apply' | 'discard', by: string, note: string, force: boolean) {
     resolveArbitration(this.store, id, decision, by, note, force);
-    this.persist();
-    this.conflicts = revalidate(this.store.state);
-    this.emit();
+    this.afterChange();
   }
 
   /** 自动分配（先落事件，再持久化、全量复核、通知） */
@@ -128,20 +125,29 @@ export class DeskStore {
   }
 
   private afterChange() {
+    // 任何写操作后：先做确认失效清扫（可能追加 CONFIRM_INVALIDATED 事件），再持久化、全量复核
+    this.sweep('系统');
     this.persist();
     this.conflicts = revalidate(this.store.state);
     this.emit();
   }
 
+  private sweep(by: string) {
+    const invalidated = sweepInvalidations(this.store, by);
+    if (invalidated.length) this.persist();
+  }
+
   /** 用外部事件链替换（跨标签页同步） */
   replaceWithEvents(events: DomainEvent[]) {
     this.store = replay(events);
+    this.sweep('系统');
     this.conflicts = revalidate(this.store.state);
     this.emit();
   }
 
   reset(seed?: () => EventStore) {
     this.store = seed ? seed() : emptyStore();
+    this.sweep('系统');
     this.persist();
     this.conflicts = revalidate(this.store.state);
     this.emit();

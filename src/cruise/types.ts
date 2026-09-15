@@ -47,7 +47,7 @@ export interface RulesConfig {
   adjacencyCabinGap: number;
 }
 
-export type VoyageStatus = 'active' | 'confirmed' | 'cancelled';
+export type VoyageStatus = 'active' | 'confirmed' | 'invalidated' | 'cancelled';
 
 export interface Voyage {
   id: string;
@@ -151,6 +151,13 @@ export interface Confirmation {
   by: string;
   ts: number;
   acknowledgedWarningIds: string[];
+  /** 确认后新增错误级冲突时，确认记录立即失效（事件链保留原确认与失效凭据） */
+  invalidated?: {
+    by: string;
+    ts: number;
+    reason: string;
+    conflictIds: string[];
+  };
 }
 
 export interface AppState {

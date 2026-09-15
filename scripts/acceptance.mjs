@@ -446,13 +446,136 @@ group('场景 6｜确认门禁：警告须知悉；确认后引入新冲突则�
   check('全部知悉后确认成功', r2.ok === true);
   check('航次状态 confirmed', s.voyages.find((v) => v.id === 'v1').status === 'confirmed');
 
-  // 确认后再制造一个错误（封有住客舱）—— 复核出现错误，清单必须回到不可放行
+  // 确认后再制造一个错误（封有住客舱）—— 复核出现错误，确认记录必须立即自动失效
   const occ = engine.cabinOccupancy(s, 'v1');
   const target = s.cabins.find((c) => (occ.get(c.id)?.length ?? 0) > 0);
   engine.setCabinStatus(store, target.id, 'sealed', '客房部');
   conflicts = engine.revalidate(s);
   check('确认后新产生错误级冲突', engine.blockingConflicts(conflicts, 'v1').length > 0);
-  check('现场已有确认记录但冲突未解除（界面须提示需撤回/重新处置）', !!s.confirmations['v1']);
+
+  // Store 的 afterChange 会立即执行失效清扫（此处直接调引擎模拟该统一入口）
+  const invalidatedIds = engine.sweepInvalidations(store, '系统');
+  check('失效清扫命中 v1', invalidatedIds.includes('v1'));
+  const conf1 = s.confirmations['v1'];
+  check('原确认记录保留但已标记 invalidated', !!conf1 && !!conf1.invalidated);
+  check('失效记录含触发冲突与原因', conf1.invalidated.conflictIds.length > 0 && conf1.invalidated.reason.includes('错误级冲突'));
+  check('航次状态变为 invalidated', s.voyages.find((v) => v.id === 'v1').status === 'invalidated');
+  check('失效已写入操作链（CONFIRM_INVALIDATED 事件）', store.events.some((e) => e.type === 'CONFIRM_INVALIDATED' && e.payload.voyageId === 'v1'));
+  check('失效后确认不再有效（isConfirmationValid=false）', engine.isConfirmationValid(s, 'v1') === false);
+
+  // 幂等：再次清扫不应重复追加失效事件
+  const evCountBefore = store.events.filter((e) => e.type === 'CONFIRM_INVALIDATED').length;
+  engine.sweepInvalidations(store, '系统');
+  const evCountAfter = store.events.filter((e) => e.type === 'CONFIRM_INVALIDATED').length;
+  check('失效清扫幂等（不重复入链）', evCountBefore === evCountAfter);
+
+  // 解除冲突后可重新确认：先解封
+  engine.setCabinStatus(store, target.id, 'normal', '客房部');
+  // 旧确认已失效，需重新走确认流程
+  conflicts = engine.revalidate(s);
+  check('解封后无错误级冲突', engine.blockingConflicts(conflicts, 'v1').length === 0);
+  const r3 = engine.confirmVoyage(store, 'v1', '主管', warnings.map((w) => w.id), conflicts);
+  check('解除后重新确认成功', r3.ok === true);
+  const conf2 = s.confirmations['v1'];
+  check('重新确认产生新的有效确认记录', !!conf2 && !conf2.invalidated);
+}
+
+// ===========================================================================
+// 场景 8：集合点单点超容（只有一个集合点在用也必须报超容）
+// ===========================================================================
+group('场景 8｜单点超容：全船旅客归集到同一集合点且超过其容量');
+{
+  // 新增一个容量为 1 的集合点 + 1 艘足够大的救生艇 + 2 间归属它的舱 + 1 个新航次
+  engine.appendEvent(store, '系统', 'STATION_ADD', { station: { id: 'sSolo', name: 'S 单点集合点', deck: '9', capacity: 1 }, ts: Date.now() });
+  engine.appendEvent(store, '系统', 'BOAT_ADD', { boat: { id: 'bSolo', name: '救生艇 S 号', stationId: 'sSolo', capacity: 20 }, ts: Date.now() });
+  const soloCabs = [
+    { id: 'cS1', number: 901, deck: '9', beds: 2, maxOccupancy: 2, accessible: false, stationId: 'sSolo', status: 'normal', version: 0 },
+    { id: 'cS2', number: 902, deck: '9', beds: 2, maxOccupancy: 2, accessible: false, stationId: 'sSolo', status: 'normal', version: 0 },
+  ];
+  for (const cabin of soloCabs) engine.appendEvent(store, '系统', 'CABIN_ADD', { cabin, ts: Date.now() });
+  engine.appendEvent(store, '系统', 'VOYAGE_ADD', {
+    voyage: { id: 'vSolo', code: 'DP-SOLO', name: '单点超容演练', departureTs: Date.parse('2026-10-01T09:00:00+08:00'), arrivalTs: Date.parse('2026-10-03T09:00:00+08:00'), status: 'active' },
+    ts: Date.now(),
+  });
+  // 2 名旅客直接住入同一舱（同属 sSolo，单点归集 2 人 > 容量 1）
+  for (const [i, cabId] of ['cS1', 'cS1'].entries()) {
+    const pid = `sp${i}`;
+    engine.appendEvent(store, '系统', 'PASSENGER_ADD', { passenger: { id: pid, name: `单点客${i}`, age: 30 + i, voyageId: 'vSolo', cabinId: null, status: 'booked' }, ts: Date.now() });
+    engine.appendEvent(store, '客服·小周', 'PROPOSAL_APPLY', {
+      proposal: { id: `prop_sp${i}`, by: '客服·小周', ts: Date.now(), note: '入住', edits: [{ cabinId: cabId, baseVersion: i, add: [pid], remove: [] }] },
+      ts: Date.now(), note: '入住',
+    });
+  }
+  conflicts = engine.revalidate(s);
+  const full = conflicts.find((c) => c.rule === 'STATION_IMBALANCE' && c.stationId === 'sSolo' && c.detail.includes('超过容量'));
+  check('唯一在用集合点超容也报 STATION_IMBALANCE 错误', !!full, conflicts.filter(c=>c.voyageId==='vSolo').map(c=>c.detail).join(' / '));
+  check('单点超容冲突指明集合点', full && full.severity === 'error');
+  check('单点超容时不能确认', engine.confirmVoyage(store, 'vSolo', '主管', [], conflicts).ok === false);
+}
+
+// ===========================================================================
+// 场景 9：集合点没有救生艇但已有旅客 → 艇位不足
+// ===========================================================================
+group('场景 9｜无艇有客：集合点未配救生艇却已归集旅客');
+{
+  engine.appendEvent(store, '系统', 'STATION_ADD', { station: { id: 'sNoBoat', name: 'N 无艇集合点', deck: '8', capacity: 40 }, ts: Date.now() });
+  engine.appendEvent(store, '系统', 'CABIN_ADD', {
+    cabin: { id: 'cN1', number: 801, deck: '8', beds: 2, maxOccupancy: 2, accessible: false, stationId: 'sNoBoat', status: 'normal', version: 0 },
+    ts: Date.now(),
+  });
+  engine.appendEvent(store, '系统', 'VOYAGE_ADD', {
+    voyage: { id: 'vNoBoat', code: 'DP-NOBOAT', name: '无艇有客演练', departureTs: Date.parse('2026-11-01T09:00:00+08:00'), arrivalTs: Date.parse('2026-11-03T09:00:00+08:00'), status: 'active' },
+    ts: Date.now(),
+  });
+  const pid = 'np0';
+  engine.appendEvent(store, '系统', 'PASSENGER_ADD', { passenger: { id: pid, name: '无艇旅客', age: 40, voyageId: 'vNoBoat', cabinId: null, status: 'booked' }, ts: Date.now() });
+  engine.appendEvent(store, '客服·小周', 'PROPOSAL_APPLY', {
+    proposal: { id: 'prop_np0', by: '客服·小周', ts: Date.now(), note: '入住', edits: [{ cabinId: 'cN1', baseVersion: 0, add: [pid], remove: [] }] },
+    ts: Date.now(), note: '入住',
+  });
+  conflicts = engine.revalidate(s);
+  const noBoat = conflicts.find((c) => c.rule === 'BOAT_OVERCAP' && c.stationId === 'sNoBoat');
+  check('无艇但有客 → BOAT_OVERCAP 错误（艇位 0）', !!noBoat && noBoat.detail.includes('未配置任何救生艇'), conflicts.filter(c=>c.voyageId==='vNoBoat').map(c=>c.detail).join(' / '));
+  check('无艇冲突为错误级', noBoat && noBoat.severity === 'error');
+  check('无艇时不能确认', engine.confirmVoyage(store, 'vNoBoat', '主管', [], conflicts).ok === false);
+
+  // 解除：补一艘艇后冲突消失
+  engine.appendEvent(store, '系统', 'BOAT_ADD', { boat: { id: 'bN1', name: '救生艇 N 号', stationId: 'sNoBoat', capacity: 20 }, ts: Date.now() });
+  conflicts = engine.revalidate(s);
+  check('补配救生艇后无艇冲突消失', !conflicts.some((c) => c.rule === 'BOAT_OVERCAP' && c.stationId === 'sNoBoat'));
+}
+
+// ===========================================================================
+// 场景 10：时间重叠并复用同舱 → 周转冲突
+// ===========================================================================
+group('场景 10｜重叠复用：与 v1 时间完全重叠的航次复用同一批舱室');
+{
+  const v1 = s.voyages.find((v) => v.id === 'v1');
+  engine.appendEvent(store, '系统', 'VOYAGE_ADD', {
+    voyage: { id: 'vOverlap', code: 'DP-OVL', name: '重叠排班演练', departureTs: v1.departureTs + 3600_000, arrivalTs: v1.arrivalTs, status: 'active' },
+    ts: Date.now(),
+  });
+  // 取 v1 在住的两间舱，各放 1 名新航次旅客（直接落 PROPOSAL_APPLY，基准版本读取当前）
+  const occV1 = engine.cabinOccupancy(s, 'v1');
+  const reuseCabins = [...occV1.keys()].slice(0, 2);
+  reuseCabins.forEach((cid, i) => {
+    const pid = `op${i}`;
+    engine.appendEvent(store, '系统', 'PASSENGER_ADD', { passenger: { id: pid, name: `重叠客${i}`, age: 35, voyageId: 'vOverlap', cabinId: null, status: 'booked' }, ts: Date.now() });
+    const ver = s.cabins.find((c) => c.id === cid).version;
+    engine.appendEvent(store, '客服·小钱', 'PROPOSAL_APPLY', {
+      proposal: { id: `prop_op${i}`, by: '客服·小钱', ts: Date.now(), note: '重叠航次复用', edits: [{ cabinId: cid, baseVersion: ver, add: [pid], remove: [] }] },
+      ts: Date.now(), note: '重叠航次复用',
+    });
+  });
+  conflicts = engine.revalidate(s);
+  const overlaps = conflicts.filter((c) => c.rule === 'TURNAROUND' && c.voyagePair?.includes('v1') && c.voyagePair?.includes('vOverlap'));
+  check('时间重叠复用同舱 → TURNAROUND 错误', overlaps.length === reuseCabins.length, `期望 ${reuseCabins.length} 条，实际 ${overlaps.length}`);
+  check('重叠冲突文案标明“时间重叠”', overlaps.every((c) => c.detail.includes('时间重叠')));
+  check('重叠冲突指明舱室与双方旅客', overlaps.every((c) => !!c.cabinId && (c.passengerIds?.length ?? 0) >= 2));
+  check('重叠冲突挂在后航次并阻止确认', engine.blockingConflicts(conflicts, 'vOverlap').some((c) => c.rule === 'TURNAROUND'));
+  // 同一对航次同一舱只报一次（不重复）
+  const ids = new Set(overlaps.map((c) => c.id));
+  check('冲突 ID 稳定且无重复', ids.size === overlaps.length);
 }
 
 // ===========================================================================
