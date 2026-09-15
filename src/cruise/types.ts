@@ -180,9 +180,21 @@ export interface DomainEvent {
   by: string;
   type: string;
   payload: unknown;
+  /** 产生该事件的客户端（标签页）标识，用于跨标签合并去重 */
+  origin?: string;
+  /** 该客户端内的单调序号 */
+  cseq?: number | string;
+  /** 显式全局身份键；缺省时由 origin#cseq 或内容哈希派生 */
+  ekey?: string;
 }
 
 export interface EventStore {
   events: DomainEvent[];
   state: AppState;
+  /** 当前客户端（标签页）标识：本端新建事件由此盖章，供跨标签并集合并 */
+  origin?: string;
+  /** 本端已用事件序号 */
+  cseq?: number;
+  /** 数据代次：重置演示数据时更换 */
+  epoch?: string;
 }

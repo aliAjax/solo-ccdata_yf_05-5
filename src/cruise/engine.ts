@@ -756,7 +756,7 @@ export function dispatchCabinProposal(
   store: EventStore,
   by: string,
   proposal: Omit<CabinEditProposal, 'id' | 'ts'>,
-): { ok: boolean; arbitrationId?: string; reason?: string } {
+): { ok: boolean; arbitrationId?: string; proposalId?: string; reason?: string } {
   const ts = Date.now();
   // 投影每间舱调整后人数，做物理床位与禁住人数校验
   const projected = new Map<string, number>();
@@ -833,7 +833,7 @@ export function dispatchCabinProposal(
 
   // 无冲突：直接生效
   appendEvent(store, by, 'PROPOSAL_APPLY', { proposal: full, ts, note: proposal.note });
-  return { ok: true, arbitrationId: undefined };
+  return { ok: true, arbitrationId: undefined, proposalId: full.id };
 }
 
 export function resolveArbitration(
@@ -903,7 +903,16 @@ export function appendEvent(store: EventStore, by: string, type: string, payload
   const ts = typeof payload.ts === 'number' ? (payload.ts as number) : Date.now();
   // 事件载荷是不可变快照；apply 必须操作其副本，使 state 与事件链互不共享对象引用
   const snapshot = clone(payload) as AnyPayload;
-  const event: DomainEvent = { id: nextId(store.state), ts, by, type, payload: snapshot };
+  // 本端身份盖章：origin#cseq 是跨标签合并的全局身份
+  store.cseq = (store.cseq ?? 0) + 1;
+  const event: DomainEvent = {
+    id: nextId(store.state),
+    ts,
+    by,
+    type,
+    payload: snapshot,
+    ...(store.origin ? { origin: store.origin, cseq: store.cseq } : {}),
+  };
   store.events.push(event);
   apply(store.state, type, clone(snapshot));
   return event;
